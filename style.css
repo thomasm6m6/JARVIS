@@ -1,0 +1,42 @@
+body {
+    font-family: Arial, sans-serif;
+    margin: 20px;
+    background-color: #121212;
+    color: white;
+}
+
+h1 {
+    font-family: monospace;
+}
+
+#transcript {
+    margin-top: 20px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    height: 400px;
+    overflow-y: auto;
+}
+
+#llm-responses {
+    margin-top: 20px;
+    padding: 10px;
+    border: 1px solid #ccc;
+    height: 400px;
+    overflow-y: auto;
+}
+
+button {
+    margin-top: 10px;
+    padding: 5px 10px;
+}
+
+#response-container {
+    display: flex;
+    flex-direction: row;
+}
+
+@media only screen and (max-width: 700px) {
+    #response-container {
+        flex-direction: column;
+    }
+}

@@ -1,101 +1,144 @@
 import asyncio
-import websockets
-import whisper
-import io
-import soundfile as sf
-from collections import deque
-import numpy as np
-from scipy.signal import resample_poly
-
-import queue
-import ollama
+import tempfile
 import threading
+import queue
+import json
+import os
+from collections import deque
 
-# Load Whisper Model
-model = whisper.load_model("base")
+from google import genai
+import websockets
+import mlx_whisper
+from silero_vad import load_silero_vad, read_audio, get_speech_timestamps
+from pydantic import BaseModel
 
+vad_model = load_silero_vad()
 transcript_queue = queue.Queue()
+clients = set()
+llmClient = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-# Function to process text and extract tasks
-def extract_tasks():
+class AssistantOutput(BaseModel):
+    response: str
+    task: str
+
+# Create an event loop for the background thread
+async def process_queue():
     while True:
-        text = transcript_queue.get()  # Get transcribed text
-        if text:
-            prompt = f"""
-            Extract all actionable tasks from this live transcript. 
-            Example: 
-            "I need to email Alex by Friday and finish my report ASAP."
-            Output:
-            [
-                {{"task": "Email Alex", "deadline": "Friday", "priority": "medium"}},
-                {{"task": "Finish my report", "deadline": "ASAP", "priority": "high"}}
-            ]
+        try:
+            # Get text from queue with a timeout to allow checking for thread exit
+            try:
+                text = transcript_queue.get(timeout=1)
+            except queue.Empty:
+                await asyncio.sleep(0.1)  # Prevent busy-waiting
+                continue
 
-            Input: {text}
-            """
-            response = ollama.chat(model="llama3.1", messages=[{"role": "user", "content": prompt}])
-            print(response["message"]["content"])  # Send tasks to database or UI
+            context = "\n".join(CONTEXT_WINDOW)
+            if text:
+                # TODO make it respond to "jarvis" more often(?)
+                # TODO give it prior context (maybe)
+                prompt = f"""
+                Your name is JARVIS. You are a helpful virtual assistant.
 
-# Start background thread to process text
-threading.Thread(target=extract_tasks, daemon=True).start()
+                Analyze the following input. It is from a person speaking.
+                They are speaking to themselves. They may occasionally ask you something; when they do, they will always call you by name.
 
-# Context retention: Keep last N sentences
-CONTEXT_WINDOW = deque(maxlen=5)
+                If the user asks you something, respond succinctly (2 sentences max), populating the "response" json field.
+                Alternatively, if the user notes something to themselves that can be construed as a task, summarize it and populate the "task" field in your response.
+                Otherwise, return both fields empty.
+                It is very important that you only fill in one of the fields when you are absolutely certain you should, because doing so unnecessarily will break the user's thought process.
 
-# Audio buffer (to accumulate ~5-10s before transcribing)
-# BUFFER_DURATION = 5  # Seconds
-# SAMPLE_RATE = 16000  # Target sample rate for Whisper
-# BYTES_PER_SAMPLE = 2  # int16 = 2 bytes per sample
-# CHANNELS = 1  # Mono audio
+                For responses, know your limitations: you should only return a sentence or two at most.
+                If the user's request would take more than a couple of short sentences to fulfill, assume that it was not meant for you and output an empty string.
+                You should not try to be interactive, so do not ask the user for a follow up.
 
-# Calculate required buffer size
-# BUFFER_SIZE = BUFFER_DURATION * SAMPLE_RATE * BYTES_PER_SAMPLE * CHANNELS
+                The input: {text}
+                """
+
+                response = llmClient.models.generate_content(
+                    model='gemini-2.0-flash',
+                    contents=prompt,
+                    config={
+                        'response_mime_type': 'application/json',
+                        'response_schema': AssistantOutput
+                    }
+                )
+                response_json = json.loads(response.text)
+                output = response_json['response']
+                llm_message = json.dumps({
+                    "type": "llm",
+                    "data": output
+                })
+                print(output)
+                print(response_json['task'])
+
+                # Create tasks for sending to all clients
+                send_tasks = []
+                for ws in clients:
+                    send_tasks.append(asyncio.create_task(ws.send(llm_message)))
+
+                # Wait for all send operations to complete
+                if send_tasks:
+                    await asyncio.gather(*send_tasks)
+
+        except Exception as e:
+            print(f"Error in process_queue: {e}")
+            await asyncio.sleep(1)  # Prevent rapid error loops
+
+def run_async_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+# Start background thread with its own event loop
+def start_background_thread():
+    loop = asyncio.new_event_loop()
+    threading.Thread(target=run_async_loop, args=(loop,), daemon=True).start()
+    asyncio.run_coroutine_threadsafe(process_queue(), loop)
+
+# Context retention: Keep last N lines
+CONTEXT_WINDOW = deque(maxlen=10)
 
 async def transcribe_audio(websocket):
-    print("Client connected, receiving audio...")
+    clients.add(websocket)
+    try:
+        async for message in websocket:
+            print("Receiving audio...")
 
-    accumulated_audio = b""
+            with tempfile.NamedTemporaryFile(suffix='.webm') as file:
+                file.write(message)
 
-    async for message in websocket:
-        accumulated_audio += message  # Collect small chunks
+                audio = read_audio(file.name)
+                speech_timestamps = get_speech_timestamps(audio, vad_model)
 
-        # Process when we have enough audio
-        if len(accumulated_audio) > 32000:  # ~1 sec at 16kHz
-            # print(f"Processing {BUFFER_DURATION}s of audio...")
+                if speech_timestamps:
+                    result = mlx_whisper.transcribe(
+                        file.name,
+                        language='en',
+                        path_or_hf_repo="/Users/tm/models/mlx/whisper-large-v3-mlx",
+                        initial_prompt="You are a digital assistant named JARVIS"
+                    )
 
-            audio_array = np.frombuffer(accumulated_audio, dtype=np.int16).astype(np.float32) / 32768.0
-
-            # if SAMPLE_RATE != 16000:
-            #     audio_array = resample_poly(audio_array, 16000, SAMPLE_RATE)
-
-            # audio_data = io.BytesIO(accumulated_audio)
-            # audio, samplerate = sf.read(audio_data, dtype='int16')
-
-            # Transcribe
-            result = model.transcribe(audio_array, fp16=False)
-            transcript = result["text"]
-
-            # Store in context window
-            CONTEXT_WINDOW.append(transcript)
-
-            # Combine for full context-aware processing
-            full_context = " ".join(CONTEXT_WINDOW)
-            print("Context-Aware Transcript:", full_context)
-
-            # TODO: Process tasks using LLM
-            # process_transcription(full_context)
-            transcript_queue.put(full_context)
-
-            accumulated_audio = b""  # Reset buffer
+                    transcript_queue.put(result['text'])
+                    # FIXME tries to send too many bytes over WS somewhere (see screenshot)
+                    await websocket.send(json.dumps({
+                        "type": "transcript",
+                        "data": result['text']
+                    }))
+                else:
+                    print("No speech detected")
+                    await websocket.send(json.dumps({
+                        "type": "transcript",
+                        "data": ""
+                    }))
+    finally:
+        clients.remove(websocket)
 
 async def main():
-    # Start WebSocket Server
-    start_server = websockets.serve(transcribe_audio, "0.0.0.0", 8765)
-    await start_server
-    print("Websocket server hopefully running...")
-    await asyncio.Future()
+    # Start the background processing thread
+    start_background_thread()
+
+    server = await websockets.serve(transcribe_audio, "0.0.0.0", 8765)
+    print("Listening...")
+    await server.wait_closed()
 
 if __name__ == "__main__":
     asyncio.run(main())
-# asyncio.get_event_loop().run_until_complete(start_server)
-# asyncio.get_event_loop().run_forever()
